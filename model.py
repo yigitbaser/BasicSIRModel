@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 class SIR:
-    def __init__(self, eons=1000, Susceptible=950, Infected=50, Resistant=0, rateSI=0.05, rateIR=0.01):
+    def __init__(self, eons=10000, Susceptible=9500, Infected=500, Resistant=0, rateSI=0.09, rateIR=0.01):
         self.eons = eons
         self.Susceptible = Susceptible
         self.Infected = Infected
@@ -44,4 +44,5 @@ class SIR:
         plt.legend(['Susceptible','Infected','Resistant'], prop={'size': 10}, loc='upper center', bbox_to_anchor=(0.5, 1.02), ncol=3, fancybox=True, shadow=True)
         plt.title(r'$\beta = {0}, \gamma = {1}$'.format(self.rateSI, self.rateIR))
         plt.savefig('test.png')
+        plt.show()
         plt.close()
