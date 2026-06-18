@@ -29,3 +29,41 @@ More complex alterations of the model will require specific engineering of the c
 
 ## Example Output
 <img width="600" alt="portfolio_view" src="https://raw.githubusercontent.com/mattravenhall/BasicSIRModel/master/example.png">
+
+---
+
+# COVID-19 Modelling Extension
+
+The original SIR model above is great for teaching but too simple to *predict*
+COVID-19. This repository now also includes a richer modelling toolkit and a
+written assessment of where SIR falls short and what to use instead.
+
+## New files
+
+| File | Purpose |
+|---|---|
+| [`REPORT.md`](REPORT.md) | Assessment of the SIR model and a survey of better models (SEIR, SEIRD, age-structured, network, agent-based, Bayesian/ensemble) with a recommendation |
+| [`models.py`](models.py) | ODE-based SIR / SIRD / SEIR / SEIRD / SEIRDV models with interpretable, literature-backed parameters and optional time-varying transmission |
+| [`statistics.py`](statistics.py) | Computes epidemic statistics: R₀, effective Rₜ(t), peak size & timing, attack rate, deaths, realised IFR, doubling time, herd-immunity threshold, epidemic duration; plus plotting |
+| [`run_statistics.py`](run_statistics.py) | Driver that runs every model, prints a statistics table and writes figures + a CSV |
+| [`PARAMETERS.md`](PARAMETERS.md) | Scientifically-backed COVID-19 parameter values, each with a peer-reviewed citation |
+| [`DATA_SOURCES.md`](DATA_SOURCES.md) | List of trusted COVID-19 data repositories for fitting/validation (WHO, OWID, JHU CSSE, CDC, ECDC, …) |
+
+## Running the new statistics model
+
+```bash
+pip install numpy scipy pandas matplotlib
+python run_statistics.py
+```
+
+This prints headline epidemic statistics for SIR vs SEIR vs SEIRD vs a
+vaccinated SEIRDV scenario, and writes `seird_trajectory.png`,
+`model_comparison.png` and `statistics_summary.csv`.
+
+```python
+import models
+from statistics import compute_statistics, format_statistics
+
+result = models.SEIRD(population=1_000_000, I0=100, days=365).run()
+print(format_statistics(compute_statistics(result)))
+```
