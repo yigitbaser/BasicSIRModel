@@ -49,6 +49,30 @@ written assessment of where SIR falls short and what to use instead.
 | [`PARAMETERS.md`](PARAMETERS.md) | Scientifically-backed COVID-19 parameter values, each with a peer-reviewed citation |
 | [`DATA_SOURCES.md`](DATA_SOURCES.md) | List of trusted COVID-19 data repositories for fitting/validation (WHO, OWID, JHU CSSE, CDC, ECDC, …) |
 
+## State-of-the-art model (Bayesian renewal model)
+
+Beyond the compartmental models above, the repository includes a **from-scratch
+state-of-the-art model** — a Bayesian semi-mechanistic *renewal* model with a
+time-varying reproduction number, fit to real data by gradient-based MCMC
+(NumPyro/JAX). This is the model family behind EpiNow2, the Imperial College
+*Nature* 2020 study, and the CDC/ECDC Forecast Hubs.
+
+| File | Purpose |
+|---|---|
+| [`SOTA_MODEL.md`](SOTA_MODEL.md) | Explains the method and why it is state of the art |
+| [`sota_model.py`](sota_model.py) | The renewal model + NUTS inference + forecasting |
+| [`sota_run.py`](sota_run.py) | Synthetic self-test, real-data loader, plotting |
+
+```bash
+pip install numpyro jax arviz numpy scipy pandas matplotlib
+python sota_run.py --synthetic                 # self-test: recover a known R_t
+python sota_run.py --country Italy --days 120   # fit real JHU data + forecast
+```
+
+It infers the time-varying R&#x209C;, nowcasts true infections behind reporting
+delays, and produces a probabilistic forecast — all with full Bayesian credible
+intervals. See `SOTA_MODEL.md` for details and validation.
+
 ## Running the new statistics model
 
 ```bash

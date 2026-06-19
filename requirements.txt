@@ -1,0 +1,10 @@
+# Core compartmental models (models.py / statistics.py)
+numpy
+scipy
+pandas
+matplotlib
+
+# State-of-the-art Bayesian renewal model (sota_model.py)
+numpyro
+jax
+arviz
