@@ -163,9 +163,17 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     L = len(gen_pmf)
     seed_days = cfg.seed_days
 
-    # Generation interval: optionally recompute inside the model from a sampled
-    # mean, propagating its uncertainty into R_t (otherwise use the fixed pmf).
-    if cfg.infer_generation_interval:
+    # The richer observation features (time-varying ascertainment, inferred
+    # generation interval) are only well identified when the *deaths* stream is
+    # present to anchor the infection scale. Fitting cases alone with those extra
+    # degrees of freedom is under-identified and makes NUTS diverge, so for
+    # cases-only data we fall back to the robust configuration (constant
+    # ascertainment, fixed generation interval) that the model used before.
+    rich_obs = deaths is not None
+
+    # Generation interval: recompute inside the model from a sampled mean (so its
+    # uncertainty propagates into R_t) only in the rich/deaths-anchored setting.
+    if cfg.infer_generation_interval and rich_obs:
         gen_mean = numpyro.sample("gen_mean", dist.TruncatedNormal(
             cfg.gen_mean, 0.5, low=2.0, high=10.0))
         gen = discretise_gamma_jax(gen_mean, cfg.gen_sd, L)
@@ -231,30 +239,30 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     log_Rt = jnp.clip(log_Rt, jnp.log(0.1), jnp.log(6.0))
     Rt = numpyro.deterministic("Rt", jnp.exp(log_Rt))
 
-    # Time-varying ascertainment: the fraction of infections that become reported
-    # cases changed enormously through 2020 as testing scaled up. We model it as
-    # a slow weekly random walk on the logit scale (interpolated to daily). When
-    # deaths are *also* fit, the death/IFR stream pins the infection scale, so
-    # rho_t becomes properly identified instead of confounded.
-    # Only the ratio (cases/deaths ~ rho/IFR) is identified by the data, so the
-    # separation of rho_t and IFR relies on their priors being tight. Crucially
-    # the ascertainment *drift* is a small FIXED constant, not a free parameter:
-    # if sigma_rho were inferred it blows up and rho_t absorbs all cases/deaths
-    # misfit, decoupling cases from the infection curve and letting R_t run away.
-    # Fixing slow drift forces both streams to share one infection trajectory,
-    # which is what makes rho and IFR jointly identifiable.
+    # Ascertainment (fraction of infections that become reported cases).
     logit_rho0 = numpyro.sample("logit_rho0", dist.Normal(_logit(0.3), 0.5))
-    sigma_rho = cfg.ascertainment_drift
-    rho_eps = numpyro.sample("rho_rw", dist.Normal(jnp.zeros(n_weeks), 1.0))
-    logit_rho_weekly = logit_rho0 + sigma_rho * jnp.cumsum(rho_eps)
-    logit_rho = jnp.interp(jnp.arange(n_steps).astype(jnp.float32), week_nodes, logit_rho_weekly)
-    rho_t = numpyro.deterministic("rho_t", jax.nn.sigmoid(logit_rho))
+    if rich_obs:
+        # Time-varying ascertainment as a slow weekly logit random walk. This is
+        # only identifiable because the joint deaths stream pins the infection
+        # scale. The drift is a small FIXED constant: if it were inferred it
+        # blows up and rho_t absorbs all cases/deaths misfit, decoupling cases
+        # from the infection curve and letting R_t run away.
+        rho_eps = numpyro.sample("rho_rw", dist.Normal(jnp.zeros(n_weeks), 1.0))
+        logit_rho_weekly = logit_rho0 + cfg.ascertainment_drift * jnp.cumsum(rho_eps)
+        logit_rho = jnp.interp(jnp.arange(n_steps).astype(jnp.float32),
+                               week_nodes, logit_rho_weekly)
+        rho_t = numpyro.deterministic("rho_t", jax.nn.sigmoid(logit_rho))
+    else:
+        # Cases-only: a single constant ascertainment (the robust, identifiable
+        # choice — a time-varying rho here is confounded with the infection scale
+        # and makes NUTS diverge).
+        rho_t = numpyro.deterministic("rho_t", jax.nn.sigmoid(logit_rho0) * jnp.ones(n_steps))
 
     # Infection fatality ratio (anchors the absolute infection scale via deaths).
-    # Informative LogNormal prior centred on the configured IFR (pre-vaccine
-    # ~0.68%); sd 0.25 in log-space keeps it within a credible ~0.4–1.1% range
-    # (literature, see PARAMETERS.md) rather than letting it absorb model misfit.
-    ifr = numpyro.sample("ifr", dist.LogNormal(jnp.log(cfg.ifr), 0.25))
+    # Only sampled when deaths are fit; informative LogNormal prior centred on the
+    # configured IFR (pre-vaccine ~0.68%), log-sd 0.25 ⇒ credible ~0.4–1.1% range.
+    if rich_obs:
+        ifr = numpyro.sample("ifr", dist.LogNormal(jnp.log(cfg.ifr), 0.25))
 
     # Day-of-week reporting multiplier (sum-to-zero on the log scale).
     dow_raw = numpyro.sample("dow", dist.Normal(jnp.zeros(7), cfg.dow_prior_sd))
@@ -262,7 +270,8 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
 
     # Negative-Binomial over-dispersion (separate for cases and deaths).
     phi = numpyro.sample("phi", dist.Exponential(0.2))
-    phi_d = numpyro.sample("phi_deaths", dist.Exponential(0.2))
+    if rich_obs:
+        phi_d = numpyro.sample("phi_deaths", dist.Exponential(0.2))
 
     # --- Latent renewal process (deterministic recursion via scan) -----------
     def step(window, Rt_t):
@@ -305,15 +314,16 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     numpyro.deterministic("expected_cases", expected)
 
     # Expected deaths = IFR * (infections convolved with infection->death delay)
-    #                   * death-reporting-completeness.
-    death_cdf = jnp.cumsum(death_pmf)
-    completeness_deaths = jnp.where(
-        days < T, death_cdf[jnp.clip(days_until_end, 0, len(death_pmf) - 1)], 1.0)
-    conv_d = jnp.convolve(infections, death_pmf)[:n_steps]
-    expected_d_complete = jnp.clip(ifr * conv_d, 1e-4, None)
-    numpyro.deterministic("expected_deaths_complete", expected_d_complete)
-    expected_d = jnp.clip(expected_d_complete * completeness_deaths, 1e-4, None)
-    numpyro.deterministic("expected_deaths", expected_d)
+    #                   * death-reporting-completeness. Only when deaths are fit.
+    if rich_obs:
+        death_cdf = jnp.cumsum(death_pmf)
+        completeness_deaths = jnp.where(
+            days < T, death_cdf[jnp.clip(days_until_end, 0, len(death_pmf) - 1)], 1.0)
+        conv_d = jnp.convolve(infections, death_pmf)[:n_steps]
+        expected_d_complete = jnp.clip(ifr * conv_d, 1e-4, None)
+        numpyro.deterministic("expected_deaths_complete", expected_d_complete)
+        expected_d = jnp.clip(expected_d_complete * completeness_deaths, 1e-4, None)
+        numpyro.deterministic("expected_deaths", expected_d)
 
     # Negative-Binomial likelihoods on the observed window only.
     if cases is not None:
