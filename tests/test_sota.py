@@ -100,6 +100,19 @@ def test_pit_values_in_unit_interval():
     assert ((pit >= 0) & (pit <= 1)).all()
 
 
+def test_waning_immunity_produces_endemic_state():
+    """Waning immunity (SEIRS) must avoid burn-out: infections persist at the end
+    of a long run, unlike the lifelong-immunity model which decays to ~0."""
+    import models
+
+    waning = models.SEIRD(population=1_000_000, I0=100, days=730, waning_days=120).run()
+    none = models.SEIRD(population=1_000_000, I0=100, days=730).run()
+    I_wane_end = waning.frame["Infected"].iloc[-1]
+    I_none_end = none.frame["Infected"].iloc[-1]
+    assert I_wane_end > 1000        # endemic plateau, not burned out
+    assert I_none_end < 10          # lifelong immunity -> burns out
+
+
 def test_synthetic_truncation_lowers_recent_counts():
     """make_synthetic(truncate=True) should report fewer of the most-recent-day
     counts than the complete (truncate=False) version, by construction."""

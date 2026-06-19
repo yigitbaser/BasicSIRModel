@@ -109,6 +109,7 @@ class CompartmentalModel:
         t_latent: float = COVID19_ANCESTRAL["t_latent"],
         ifr: float = COVID19_ANCESTRAL["ifr"],
         vacc_rate: float = 0.0,
+        waning_days: float = 0.0,
         beta_t: Callable[[float, float], float] | None = None,
         variant: str = "seird",
     ):
@@ -124,6 +125,7 @@ class CompartmentalModel:
         self.t_latent = float(t_latent)
         self.ifr = float(ifr)
         self.vacc_rate = float(vacc_rate)
+        self.waning_days = float(waning_days) if waning_days else 0.0
         self.beta_t = beta_t
         self.variant = variant.lower()
 
@@ -177,7 +179,15 @@ class CompartmentalModel:
             vacc = self.vacc_rate * S
             dS -= vacc
 
-        dR = to_recovered + vacc
+        # Optional waning immunity (SIRS/SEIRS): recovered individuals lose
+        # immunity at rate 1/waning_days and return to Susceptible. This is what
+        # turns a single epidemic into recurring waves / an endemic steady state.
+        waning = 0.0
+        if self.waning_days > 0:
+            waning = R / self.waning_days
+            dS += waning
+
+        dR = to_recovered + vacc - waning
         dD = to_dead
         dC = infection  # cumulative new infections (true attack-rate numerator)
 
