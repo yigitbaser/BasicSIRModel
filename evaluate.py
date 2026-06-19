@@ -183,7 +183,7 @@ def main():
 
     cfg = EpiConfig()
     print("Generating synthetic epidemic and backtesting the forecast...")
-    cases, _, _, _ = make_synthetic(cfg, T=140)
+    cases, _, _, _, _ = make_synthetic(cfg, T=140)
     # Forecast from several origins along the epidemic.
     results = rolling_backtest(cases, cfg, train_ends=[70, 90, 110],
                                horizon=14, num_warmup=400, num_samples=400)

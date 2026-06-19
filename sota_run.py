@@ -38,10 +38,11 @@ from sota_model import (
 # ---------------------------------------------------------------------------
 # Synthetic ground-truth generator (for validation).
 # ---------------------------------------------------------------------------
-def make_synthetic(cfg: EpiConfig, T=120, seed=1):
+def make_synthetic(cfg: EpiConfig, T=120, seed=1, truncate=False):
     rng = np.random.default_rng(seed)
     gen = discretise_gamma(cfg.gen_mean, cfg.gen_sd, cfg.gen_max)
     rep = discretise_lognormal(cfg.rep_mean, cfg.rep_sd, cfg.rep_max)
+    death_delay = discretise_lognormal(cfg.death_mean, cfg.death_sd, cfg.death_max)
 
     # A realistic R_t story: ~2.4 early, sharp lockdown drop below 1, partial
     # relaxation back toward 1.1.
@@ -63,45 +64,70 @@ def make_synthetic(cfg: EpiConfig, T=120, seed=1):
         infections[i] = I_t
         window = np.concatenate([window[1:], [I_t]])
 
-    # Observation: report delay, ascertainment, weekly effect, NB noise.
-    rho_true = 0.3
+    # Optional right-truncation: emulate incomplete reporting of the most recent
+    # days (real-time surveillance). Off by default so the synthetic matches the
+    # default complete-data case; set truncate=True (with cfg.apply_truncation)
+    # to exercise the model's reporting-completeness correction.
+    dist_end = (T - 1 - t)
+    if truncate:
+        comp_c = np.cumsum(rep)[np.clip(dist_end, 0, len(rep) - 1)]
+        comp_d = np.cumsum(death_delay)[np.clip(dist_end, 0, len(death_delay) - 1)]
+    else:
+        comp_c = comp_d = np.ones(T)
+
+    # Cases: ascertainment ramps UP over time (testing scaled up), to exercise the
+    # time-varying-rho machinery.
+    rho_true = 0.15 + 0.25 * (t / T)            # 15% -> 40%
     conv = np.convolve(infections, rep)[:T]
     dow = np.array([0.0, 0.05, 0.05, 0.0, -0.05, -0.15, -0.1])  # weekend dip
-    expected = rho_true * conv * np.exp(dow[t % 7])
+    expected = rho_true * conv * np.exp(dow[t % 7]) * comp_c
     phi = 10.0
     cases = rng.negative_binomial(phi, phi / (phi + expected)).astype(float)
-    return cases, Rt, infections, rho_true
+
+    # Deaths: infection-fatality ratio * (infections convolved with death delay).
+    ifr_true = 0.0068
+    conv_d = np.convolve(infections, death_delay)[:T]
+    expected_d = ifr_true * conv_d * comp_d
+    phi_d = 15.0
+    deaths = rng.negative_binomial(phi_d, phi_d / (phi_d + expected_d)).astype(float)
+    return cases, Rt, infections, rho_true, deaths
 
 
 # ---------------------------------------------------------------------------
 # Real data loader (JHU CSSE archived time series; robust, moderate size).
 # ---------------------------------------------------------------------------
-JHU_CONFIRMED = (
+JHU_BASE = (
     "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/"
     "csse_covid_19_data/csse_covid_19_time_series/"
-    "time_series_covid19_confirmed_global.csv"
 )
+JHU_CONFIRMED = JHU_BASE + "time_series_covid19_confirmed_global.csv"
+JHU_DEATHS = JHU_BASE + "time_series_covid19_deaths_global.csv"
 
 
-def load_country(country: str, start: str, days: int):
-    """Download JHU confirmed cumulative cases for a country -> daily incidence."""
-    with urllib.request.urlopen(JHU_CONFIRMED, timeout=60) as r:
+def _daily_from_jhu(url, country, start, days):
+    with urllib.request.urlopen(url, timeout=60) as r:
         df = pd.read_csv(io.BytesIO(r.read()))
     sub = df[df["Country/Region"] == country]
     if sub.empty:
         raise ValueError(f"Country {country!r} not found in JHU data.")
-    # Sum provinces, drop the 4 metadata columns, build a daily series.
     cum = sub.iloc[:, 4:].sum(axis=0)
     cum.index = pd.to_datetime(cum.index, format="%m/%d/%y")
     daily = cum.diff().clip(lower=0).fillna(0)
-    daily = daily[daily.index >= pd.Timestamp(start)].iloc[:days]
-    return daily
+    return daily[daily.index >= pd.Timestamp(start)].iloc[:days]
+
+
+def load_country(country: str, start: str, days: int):
+    """Download JHU confirmed + deaths for a country -> daily cases, daily deaths."""
+    cases = _daily_from_jhu(JHU_CONFIRMED, country, start, days)
+    deaths = _daily_from_jhu(JHU_DEATHS, country, start, days)
+    return cases, deaths
 
 
 # ---------------------------------------------------------------------------
 # Plots.
 # ---------------------------------------------------------------------------
-def plot_results(samples, cases, horizon, title, true_Rt=None, true_inf=None, burn_in=14, tag=""):
+def plot_results(samples, cases, horizon, title, true_Rt=None, true_inf=None,
+                 burn_in=14, tag="", deaths=None):
     """Plot R_t and the forecast.
 
     The first `burn_in` days are a seeding/burn-in region: the renewal window
@@ -169,6 +195,34 @@ def plot_results(samples, cases, horizon, title, true_Rt=None, true_inf=None, bu
     plt.close(fig)
     print(f"Wrote sota_Rt{tag}.png and sota_forecast{tag}.png")
 
+    # --- Deaths panel (only when the model was fit with a deaths stream) ------
+    if deaths is not None and "expected_deaths" in samples:
+        from sota_model import posterior_predictive_deaths
+
+        dpred = posterior_predictive_deaths(samples)
+        dlo, dmid, dhi = credible_band(dpred)
+        dlo50, _, dhi50 = credible_band(dpred, 0.25, 0.75)
+        dmax = float(np.max(deaths)) * 2.5 + 1
+        fig, ax = plt.subplots(figsize=(11, 5))
+        ax.fill_between(days, dlo, dhi, color="C3", alpha=0.15, label="90% CrI")
+        ax.fill_between(days, dlo50, dhi50, color="C3", alpha=0.25, label="50% CrI")
+        ax.plot(days, dmid, color="C3", lw=2, label="Posterior median")
+        ax.scatter(np.arange(len(deaths)), deaths, s=12, color="black", zorder=5,
+                   label="Observed deaths")
+        ax.axvline(T - 1, color="grey", ls=":", lw=1)
+        ax.set_xlim(x0, n_steps - 1)
+        ax.set_ylim(0, dmax)
+        ax.text(T - 1, dmax * 0.9, " forecast →", color="grey", fontsize=9)
+        ax.set_xlabel("Day")
+        ax.set_ylabel("Reported deaths / day")
+        ax.set_title(f"{title} — deaths fit + {horizon}-day forecast")
+        ax.legend(loc="upper left")
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(f"sota_deaths{tag}.png", dpi=120)
+        plt.close(fig)
+        print(f"Wrote sota_deaths{tag}.png")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -181,34 +235,47 @@ def main():
     ap.add_argument("--samples", type=int, default=600)
     ap.add_argument("--save", default=None, help="save posterior samples to this .npz path")
     ap.add_argument("--load", default=None, help="skip MCMC and load posterior samples from .npz")
+    ap.add_argument("--with-deaths", action="store_true",
+                    help="jointly fit the deaths stream on REAL data too (off by default: "
+                         "joint real-data fitting is sensitive to delay misspecification; "
+                         "the deaths machinery is validated on synthetic data instead)")
     args = ap.parse_args()
 
     cfg = EpiConfig()
-    true_Rt = true_inf = None
+    true_Rt = true_inf = deaths = None
+    # Deaths used in the likelihood. Synthetic always fits deaths (it validates
+    # the joint machinery against a known truth). Real data fits cases-only by
+    # default — joint real-data fitting is sensitive to delay misspecification —
+    # unless the user opts in with --with-deaths.
+    fit_deaths = None
 
     if args.synthetic:
         print("Generating synthetic epidemic with a known R_t (lockdown scenario)...")
-        cases, true_Rt, true_inf, rho_true = make_synthetic(cfg, T=args.days)
+        cases, true_Rt, true_inf, _, deaths = make_synthetic(cfg, T=args.days)
+        fit_deaths = deaths
         title = "SYNTHETIC self-test"
-        print(f"  True ascertainment rho = {rho_true:.0%}")
     else:
         print(f"Downloading JHU data for {args.country} from {args.start} ({args.days} days)...")
         try:
-            daily = load_country(args.country, args.start, args.days)
-            cases = daily.to_numpy(dtype=float)
+            c, d = load_country(args.country, args.start, args.days)
+            cases = c.to_numpy(dtype=float)
+            deaths = d.to_numpy(dtype=float)
+            fit_deaths = deaths if args.with_deaths else None
             title = f"{args.country} (from {args.start})"
         except Exception as e:  # noqa: BLE001 - fall back to synthetic if offline
             print(f"  Data download failed ({e!r}); falling back to synthetic mode.")
-            cases, true_Rt, true_inf, _ = make_synthetic(cfg, T=args.days)
+            cases, true_Rt, true_inf, _, deaths = make_synthetic(cfg, T=args.days)
+            fit_deaths = deaths
             title = "SYNTHETIC (network fallback)"
 
     if args.load:
         print(f"Loading posterior samples from {args.load} (skipping MCMC)...")
         samples = load_samples(args.load)
     else:
-        print(f"Fitting renewal model on {len(cases)} days with NUTS "
+        streams = "cases + deaths" if fit_deaths is not None else "cases only"
+        print(f"Fitting renewal model ({streams}) on {len(cases)} days with NUTS "
               f"({args.warmup} warmup + {args.samples} samples x2 chains)...")
-        mcmc, _, _ = fit(cases, cfg, horizon=args.horizon,
+        mcmc, _, _ = fit(cases, cfg, horizon=args.horizon, deaths=fit_deaths,
                          num_warmup=args.warmup, num_samples=args.samples)
         mcmc.print_summary(exclude_deterministic=True)
         samples = mcmc.get_samples()
@@ -218,7 +285,9 @@ def main():
 
     summarise_samples(samples)
     tag = "_synthetic" if args.synthetic else f"_{args.country.lower()}"
-    plot_results(samples, cases, args.horizon, title, true_Rt, true_inf, tag=tag)
+    # Only draw the deaths panel when deaths were actually in the likelihood.
+    plot_results(samples, cases, args.horizon, title, true_Rt, true_inf, tag=tag,
+                 deaths=fit_deaths)
 
 
 if __name__ == "__main__":

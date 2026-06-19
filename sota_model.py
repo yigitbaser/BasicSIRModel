@@ -50,15 +50,20 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.special as jsp
 import numpy as np
 from scipy.stats import gamma as gamma_dist
 from scipy.stats import lognorm
 
 import numpyro
 import numpyro.distributions as dist
-from numpyro.infer import MCMC, NUTS, Predictive
+from numpyro.infer import MCMC, NUTS, Predictive, init_to_median
 
 numpyro.set_host_device_count(2)
+
+
+def _logit(p):
+    return float(np.log(p / (1.0 - p)))
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +83,21 @@ def discretise_gamma(mean: float, sd: float, length: int) -> np.ndarray:
     pmf = np.diff(cdf)
     pmf = pmf / pmf.sum()
     return pmf  # index 0 == lag 1 day
+
+
+def discretise_gamma_jax(mean, sd, length: int):
+    """JAX/differentiable version of `discretise_gamma` (days 1..length).
+
+    Uses the regularised lower incomplete gamma function so the generation
+    interval can be recomputed *inside* the model when its mean is itself a
+    sampled parameter (propagating generation-interval uncertainty into R_t).
+    """
+    shape = (mean / sd) ** 2
+    scale = sd**2 / mean
+    edges = jnp.arange(0, length + 1).astype(jnp.float32)
+    cdf = jsp.gammainc(shape, edges / scale)     # regularised lower incomplete gamma
+    pmf = jnp.diff(cdf)
+    return pmf / pmf.sum()
 
 
 def discretise_lognormal(mean: float, sd: float, length: int) -> np.ndarray:
@@ -103,15 +123,23 @@ class EpiConfig:
     rep_mean: float = 9.0     # infection -> case-report delay mean (incubation+reporting)
     rep_sd: float = 4.5       # infection -> case-report delay sd
     rep_max: int = 30         # truncation length for the reporting delay
+    death_mean: float = 19.0  # infection -> death delay mean (days); ~incubation+onset-to-death
+    death_sd: float = 8.5     # infection -> death delay sd
+    death_max: int = 45       # truncation length for the death delay
+    ifr: float = 0.0068       # infection fatality ratio prior centre (pre-vaccine, ~0.68%)
     seed_days: int = 7        # number of days of seeded initial infections
     forecast_damping: float = 0.85  # AR(1) damping of R_t over the forecast horizon
     dow_prior_sd: float = 0.15      # prior sd of the day-of-week (log) effect
+    infer_generation_interval: bool = True  # propagate generation-interval uncertainty
+    ascertainment_drift: float = 0.05  # FIXED weekly logit-rho drift (kept small on purpose)
+    apply_truncation: bool = False     # right-truncation correction (ONLY for real-time data)
 
 
 # ---------------------------------------------------------------------------
 # The probabilistic model.
 # ---------------------------------------------------------------------------
-def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf=None):
+def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf=None,
+                  deaths=None, death_pmf=None):
     """NumPyro model: latent renewal process + reporting observation model.
 
     Parameters
@@ -122,15 +150,36 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
         Fixed epidemiological inputs.
     horizon : int
         Number of future days to forecast beyond the observed window.
-    gen_pmf, rep_pmf : arrays
-        Pre-computed generation-interval / reporting-delay pmfs.
+    gen_pmf, rep_pmf, death_pmf : arrays
+        Pre-computed generation-interval / reporting-delay / infection-to-death pmfs.
+    deaths : array (T,) or None
+        Optional observed daily deaths. When supplied, deaths are fit *jointly*
+        with cases. Because deaths are far less sensitive to testing capacity,
+        this stream — anchored by the infection-fatality ratio — pins the
+        absolute infection scale and removes the case-only ascertainment
+        confounding.
     """
     T = len(cases) if cases is not None else 60
     n_steps = T + horizon                      # total days of latent infections to model
     L = len(gen_pmf)
     seed_days = cfg.seed_days
 
-    gen = jnp.asarray(gen_pmf)
+    # The richer observation features (time-varying ascertainment, inferred
+    # generation interval) are only well identified when the *deaths* stream is
+    # present to anchor the infection scale. Fitting cases alone with those extra
+    # degrees of freedom is under-identified and makes NUTS diverge, so for
+    # cases-only data we fall back to the robust configuration (constant
+    # ascertainment, fixed generation interval) that the model used before.
+    rich_obs = deaths is not None
+
+    # Generation interval: recompute inside the model from a sampled mean (so its
+    # uncertainty propagates into R_t) only in the rich/deaths-anchored setting.
+    if cfg.infer_generation_interval and rich_obs:
+        gen_mean = numpyro.sample("gen_mean", dist.TruncatedNormal(
+            cfg.gen_mean, 0.5, low=2.0, high=10.0))
+        gen = discretise_gamma_jax(gen_mean, cfg.gen_sd, L)
+    else:
+        gen = jnp.asarray(gen_pmf)
     gen_flip = gen[::-1]                        # align with a chronological window
     rep = jnp.asarray(rep_pmf)
 
@@ -188,22 +237,42 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     log_Rt = jnp.interp(jnp.arange(n_steps).astype(jnp.float32), week_nodes, log_Rt_weekly)
     # Bound R_t to a plausible epidemic range so the renewal recursion can never
     # overflow to infinity (which would produce NaN gradients / divergences).
-    log_Rt = jnp.clip(log_Rt, jnp.log(0.1), jnp.log(8.0))
+    log_Rt = jnp.clip(log_Rt, jnp.log(0.1), jnp.log(6.0))
     Rt = numpyro.deterministic("Rt", jnp.exp(log_Rt))
 
     # Ascertainment (fraction of infections that become reported cases).
-    # In case-only data only (rho * infections) is identified, so we use an
-    # informative prior — Beta(6, 14): mean 0.30, sd ~0.10 — reflecting external
-    # seroprevalence evidence that ~1 in 3 infections were reported. This
-    # regularises the otherwise-confounded infection scale.
-    rho = numpyro.sample("rho", dist.Beta(6.0, 14.0))
+    logit_rho0 = numpyro.sample("logit_rho0", dist.Normal(_logit(0.3), 0.5))
+    if rich_obs:
+        # Time-varying ascertainment as a slow weekly logit random walk. This is
+        # only identifiable because the joint deaths stream pins the infection
+        # scale. The drift is a small FIXED constant: if it were inferred it
+        # blows up and rho_t absorbs all cases/deaths misfit, decoupling cases
+        # from the infection curve and letting R_t run away.
+        rho_eps = numpyro.sample("rho_rw", dist.Normal(jnp.zeros(n_weeks), 1.0))
+        logit_rho_weekly = logit_rho0 + cfg.ascertainment_drift * jnp.cumsum(rho_eps)
+        logit_rho = jnp.interp(jnp.arange(n_steps).astype(jnp.float32),
+                               week_nodes, logit_rho_weekly)
+        rho_t = numpyro.deterministic("rho_t", jax.nn.sigmoid(logit_rho))
+    else:
+        # Cases-only: a single constant ascertainment (the robust, identifiable
+        # choice — a time-varying rho here is confounded with the infection scale
+        # and makes NUTS diverge).
+        rho_t = numpyro.deterministic("rho_t", jax.nn.sigmoid(logit_rho0) * jnp.ones(n_steps))
+
+    # Infection fatality ratio (anchors the absolute infection scale via deaths).
+    # Only sampled when deaths are fit; informative LogNormal prior centred on the
+    # configured IFR (pre-vaccine ~0.68%), log-sd 0.25 ⇒ credible ~0.4–1.1% range.
+    if rich_obs:
+        ifr = numpyro.sample("ifr", dist.LogNormal(jnp.log(cfg.ifr), 0.25))
 
     # Day-of-week reporting multiplier (sum-to-zero on the log scale).
     dow_raw = numpyro.sample("dow", dist.Normal(jnp.zeros(7), cfg.dow_prior_sd))
     dow = dow_raw - jnp.mean(dow_raw)
 
-    # Negative-Binomial over-dispersion.
+    # Negative-Binomial over-dispersion (separate for cases and deaths).
     phi = numpyro.sample("phi", dist.Exponential(0.2))
+    if rich_obs:
+        phi_d = numpyro.sample("phi_deaths", dist.Exponential(0.2))
 
     # --- Latent renewal process (deterministic recursion via scan) -----------
     def step(window, Rt_t):
@@ -219,15 +288,51 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     infections = numpyro.deterministic("infections", I_scanned)  # length n_steps
 
     # --- Observation model ----------------------------------------------------
-    # Expected reported cases = ascertainment * (infections convolved with delay).
-    # Full convolution then crop to the modelled days.
+    days = jnp.arange(n_steps)
+
+    # Right-truncation: for REAL-TIME data the most recent days are only partially
+    # reported (the infection->report delay has not fully elapsed), so expected
+    # counts are scaled by the delay-CDF completeness. This is OFF by default
+    # because archived/historical data (e.g. the JHU final series) is already
+    # complete — applying the correction there would divide the last day's count
+    # by a tiny completeness and spuriously inflate recent infections / R_t.
+    days_until_end = (T - 1 - days).astype(jnp.int32)
+    if cfg.apply_truncation:
+        rep_cdf = jnp.cumsum(rep)
+        completeness_cases = jnp.where(
+            days < T, rep_cdf[jnp.clip(days_until_end, 0, len(rep) - 1)], 1.0)
+    else:
+        completeness_cases = jnp.ones(n_steps)
+
+    # Expected reported cases = ascertainment(t) * (infections * report delay)
+    #                           * day-of-week * reporting-completeness.
     conv = jnp.convolve(infections, rep)[:n_steps]
-    weekday = jnp.arange(n_steps) % 7
-    expected = rho * conv * jnp.exp(dow[weekday])
-    expected = jnp.clip(expected, 1e-3, None)
+    weekday = days % 7
+    # "Complete" expectation = what counts will be once fully reported (the
+    # nowcast/forecast quantity, continuous across the data->forecast boundary).
+    expected_complete = jnp.clip(rho_t * conv * jnp.exp(dow[weekday]), 1e-3, None)
+    numpyro.deterministic("expected_cases_complete", expected_complete)
+    # Truncated expectation = what has been reported so far; used for the
+    # likelihood against the (incomplete) recent observations.
+    expected = jnp.clip(expected_complete * completeness_cases, 1e-3, None)
     numpyro.deterministic("expected_cases", expected)
 
-    # Negative-Binomial likelihood on the observed window only.
+    # Expected deaths = IFR * (infections convolved with infection->death delay)
+    #                   * death-reporting-completeness. Only when deaths are fit.
+    if rich_obs:
+        if cfg.apply_truncation:
+            death_cdf = jnp.cumsum(death_pmf)
+            completeness_deaths = jnp.where(
+                days < T, death_cdf[jnp.clip(days_until_end, 0, len(death_pmf) - 1)], 1.0)
+        else:
+            completeness_deaths = jnp.ones(n_steps)
+        conv_d = jnp.convolve(infections, death_pmf)[:n_steps]
+        expected_d_complete = jnp.clip(ifr * conv_d, 1e-4, None)
+        numpyro.deterministic("expected_deaths_complete", expected_d_complete)
+        expected_d = jnp.clip(expected_d_complete * completeness_deaths, 1e-4, None)
+        numpyro.deterministic("expected_deaths", expected_d)
+
+    # Negative-Binomial likelihoods on the observed window only.
     if cases is not None:
         with numpyro.plate("obs_time", T):
             numpyro.sample(
@@ -235,19 +340,31 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
                 dist.GammaPoisson(concentration=phi, rate=phi / expected[:T]),
                 obs=jnp.asarray(cases),
             )
-    # Posterior-predictive cases (incl. the forecast horizon) are generated
-    # afterwards in numpy from `expected_cases` + `phi`, to keep the model free
-    # of discrete latent sites that gradient-based NUTS cannot sample.
+    if deaths is not None:
+        with numpyro.plate("obs_time_d", T):
+            numpyro.sample(
+                "obs_deaths",
+                dist.GammaPoisson(concentration=phi_d, rate=phi_d / expected_d[:T]),
+                obs=jnp.asarray(deaths),
+            )
+    # Posterior-predictive cases/deaths (incl. forecast) are generated afterwards
+    # in numpy from the deterministic `expected_*` + dispersions, to keep the
+    # model free of discrete latent sites that gradient-based NUTS cannot sample.
 
 
 # ---------------------------------------------------------------------------
 # Fitting & forecasting orchestration.
 # ---------------------------------------------------------------------------
-def fit(cases, cfg: EpiConfig, horizon: int = 14, num_warmup=600, num_samples=600, chains=2, seed=0):
+def fit(cases, cfg: EpiConfig, horizon: int = 14, num_warmup=600, num_samples=600,
+        chains=2, seed=0, deaths=None):
     gen_pmf = discretise_gamma(cfg.gen_mean, cfg.gen_sd, cfg.gen_max)
     rep_pmf = discretise_lognormal(cfg.rep_mean, cfg.rep_sd, cfg.rep_max)
+    death_pmf = discretise_lognormal(cfg.death_mean, cfg.death_sd, cfg.death_max)
 
-    kernel = NUTS(renewal_model, target_accept_prob=0.95, max_tree_depth=12)
+    # init_to_median keeps the sampler off the prior tails / clip boundaries that
+    # the default uniform init can land on with this many latent dimensions.
+    kernel = NUTS(renewal_model, target_accept_prob=0.95, max_tree_depth=12,
+                  init_strategy=init_to_median)
     mcmc = MCMC(
         kernel,
         num_warmup=num_warmup,
@@ -262,6 +379,8 @@ def fit(cases, cfg: EpiConfig, horizon: int = 14, num_warmup=600, num_samples=60
         horizon=horizon,
         gen_pmf=gen_pmf,
         rep_pmf=rep_pmf,
+        deaths=None if deaths is None else jnp.asarray(deaths, dtype=jnp.float32),
+        death_pmf=death_pmf,
     )
     return mcmc, gen_pmf, rep_pmf
 
@@ -274,15 +393,21 @@ def summarise(mcmc):
 def summarise_samples(samples):
     """Print the latest reproduction number from a posterior-samples dict."""
     Rt = np.asarray(samples["Rt"])  # (draws, n_steps)
-    rho = np.asarray(samples["rho"])
     Rt_now = Rt[:, -1]  # last modelled day (end of forecast horizon)
     print("\n=== Posterior summary ===")
-    print(f"  Ascertainment rho....... {np.median(rho):.2%}  "
-          f"(90% CrI {np.quantile(rho,0.05):.2%}–{np.quantile(rho,0.95):.2%})")
-    print(f"  Final-day R_t........... {np.median(Rt_now):.2f}  "
+    if "rho_t" in samples:
+        # Report ascertainment at the most recent *observed* day (rho varies in time).
+        rho_now = np.asarray(samples["rho_t"])[:, -1]
+        print(f"  Ascertainment rho (latest) {np.median(rho_now):.2%}  "
+              f"(90% CrI {np.quantile(rho_now,0.05):.2%}–{np.quantile(rho_now,0.95):.2%})")
+    if "ifr" in samples:
+        ifr = np.asarray(samples["ifr"])
+        print(f"  Infection fatality ratio.. {np.median(ifr):.2%}  "
+              f"(90% CrI {np.quantile(ifr,0.05):.2%}–{np.quantile(ifr,0.95):.2%})")
+    print(f"  Final-day R_t............. {np.median(Rt_now):.2f}  "
           f"(90% CrI {np.quantile(Rt_now,0.05):.2f}–{np.quantile(Rt_now,0.95):.2f})")
     prob_above_1 = float(np.mean(Rt_now > 1.0))
-    print(f"  P(R_t > 1) at horizon... {prob_above_1:.0%}  "
+    print(f"  P(R_t > 1) at horizon..... {prob_above_1:.0%}  "
           f"=> epidemic {'GROWING' if prob_above_1 > 0.5 else 'SHRINKING'}")
     return samples
 
@@ -303,19 +428,34 @@ def load_samples(path):
         return {k: data[k] for k in data.files}
 
 
-def posterior_predictive_cases(samples, seed=0):
+def posterior_predictive_cases(samples, seed=0, complete=True):
     """Draw posterior-predictive reported cases (fit + forecast) in numpy.
 
     For each posterior draw we sample Negative-Binomial observation noise around
-    that draw's `expected_cases`, using its over-dispersion `phi`. The spread of
+    that draw's expected cases, using its over-dispersion `phi`. The spread of
     the result is the full predictive uncertainty shown on the forecast plot.
     """
+    # `complete=True` gives the nowcast/forecast quantity (eventual fully-reported
+    # counts, continuous across the boundary); the raw observed data are the
+    # truncated counts and are plotted as points.
+    key = "expected_cases_complete" if complete and "expected_cases_complete" in samples else "expected_cases"
+    return _nb_predictive(samples[key], samples["phi"], seed)
+
+
+def posterior_predictive_deaths(samples, seed=1, complete=True):
+    """Draw posterior-predictive daily deaths (fit + forecast) in numpy."""
+    if "expected_deaths" not in samples:
+        raise KeyError("This posterior has no deaths stream (model fit without deaths).")
+    key = "expected_deaths_complete" if complete and "expected_deaths_complete" in samples else "expected_deaths"
+    return _nb_predictive(samples[key], samples["phi_deaths"], seed)
+
+
+def _nb_predictive(expected, phi, seed):
+    """Sample Negative-Binomial counts from a Gamma-Poisson mixture (stable for
+    large means where numpy's negative_binomial (n,p) form underflows)."""
     rng = np.random.default_rng(seed)
-    expected = np.clip(np.asarray(samples["expected_cases"]), 1e-3, 1e9)  # (draws, n_steps)
-    phi = np.asarray(samples["phi"])[:, None]                 # (draws, 1)
-    # Draw from the Gamma-Poisson (Negative-Binomial) mixture directly: this is
-    # numerically stable for the large case counts where the (n, p) form of
-    # numpy's negative_binomial underflows.
+    expected = np.clip(np.asarray(expected), 1e-4, 1e9)        # (draws, n_steps)
+    phi = np.asarray(phi)[:, None]                             # (draws, 1)
     rate = rng.gamma(shape=phi, scale=expected / phi)
     rate = np.clip(rate, 0.0, 1e12)
     return rng.poisson(rate)

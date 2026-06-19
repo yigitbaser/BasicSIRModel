@@ -100,5 +100,20 @@ def test_pit_values_in_unit_interval():
     assert ((pit >= 0) & (pit <= 1)).all()
 
 
+def test_synthetic_truncation_lowers_recent_counts():
+    """make_synthetic(truncate=True) should report fewer of the most-recent-day
+    counts than the complete (truncate=False) version, by construction."""
+    from sota_model import EpiConfig
+    from sota_run import make_synthetic
+
+    cfg = EpiConfig()
+    full = make_synthetic(cfg, T=120, seed=3, truncate=False)[0]
+    trunc = make_synthetic(cfg, T=120, seed=3, truncate=True)[0]
+    # The last few days are heavily truncated; their sum must drop.
+    assert trunc[-5:].sum() < full[-5:].sum()
+    # Early days are essentially complete in both.
+    assert abs(trunc[:50].sum() - full[:50].sum()) / full[:50].sum() < 0.05
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
