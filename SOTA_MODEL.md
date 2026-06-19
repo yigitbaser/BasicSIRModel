@@ -100,22 +100,55 @@ renewal recursion is implemented with `jax.lax.scan` so the whole model is
 differentiable and fast. Output is a full **posterior** over `R_t`, latent
 infections, and all parameters.
 
-### 2.5 Probabilistic forecasting
+### 2.5 Probabilistic forecasting (dampened R_t)
 
-To forecast *H* days ahead, the `R_t` random walk is simply extended *H* steps
-into the future; the renewal equation propagates infections forward and the
-observation model produces a **posterior-predictive** case forecast. Because the
-random walk's variance grows with the horizon, **forecast uncertainty widens
-automatically** — there is no false confidence.
+To forecast *H* days ahead, `R_t` is projected forward and the renewal equation
+propagates infections, producing a **posterior-predictive** case forecast.
+
+Crucially, the forecast `R_t` does **not** follow a pure random walk (whose
+variance grows without bound, giving absurdly wide intervals — e.g. a final-day
+`R_t` interval of 0.1–8). Instead the forecast weeks follow a **dampened AR(1)**
+process that reverts toward the last in-sample `R_t` level:
+
+```
+log R_w = anchor + d · (log R_{w−1} − anchor) + σ · ε_w,   0 < d < 1
+```
+
+With damping `d < 1` the innovation variance **saturates** instead of growing,
+so forecast credible intervals stay realistic while still widening with the
+horizon. This matches the dampened-RW projection used by EpiNow2.
+
+### 2.6 Seeding
+
+The first weeks of any renewal model are sensitive to how the epidemic is
+*seeded* before the data window opens. The model seeds the initial
+generation-interval window at a single inferred level. (A more flexible
+exponential seed — inferring a per-day growth across the window — was tried and
+**reverted**: it created a degeneracy in which a decaying seed could explain the
+data *instead of* transmission, biasing R_t low and inflating its uncertainty.
+This is a good example of why every change is re-validated against a known
+synthetic truth before being kept.) The short start-up burn-in the single-level
+seed leaves is excluded from plots and interpretation.
 
 ---
 
 ## 3. Validation (this is important)
 
-A model you cannot validate is not science. `sota_run.py --synthetic`
+A model you cannot validate is not science. There are two layers of validation.
+
+**(a) Recovering a known R_t.** `sota_run.py --synthetic`
 **simulates an epidemic from a known, changing R_t** (a rise to 2.4, a lockdown
 decline below 1, then a partial rebound to 1.1), adds realistic reporting noise,
 then fits the model **blind** and checks recovery.
+
+**(b) Proper scoring & calibration (`evaluate.py`).** Qualitative recovery is
+not enough. `evaluate.py` runs **backtests** — fit on a training window, forecast
+a held-out horizon, and score the forecast with the **Weighted Interval Score
+(WIS)**, the COVID-19 Forecast Hub's headline metric — plus **interval coverage**
+(do the 50%/90% intervals contain truth 50%/90% of the time?) and a **PIT
+calibration histogram** (flat ⇒ calibrated). Run `python evaluate.py` for a
+self-contained rolling backtest; it writes `sota_calibration.png`. This turns
+"looks right" into a measured, falsifiable claim.
 
 Result (see `sota_Rt_synthetic.png`): the posterior median R_t tracks the true
 trajectory closely, the true curve stays within the credible band throughout,
@@ -154,6 +187,16 @@ python sota_run.py --synthetic
 
 # 2) Real data: fit a country window from the JHU CSSE archive
 python sota_run.py --country Italy --start 2020-08-15 --days 120 --horizon 14
+
+# 3) Backtest + proper scoring (WIS / coverage / PIT calibration)
+python evaluate.py
+
+# 4) Save the posterior once, then re-plot without re-running MCMC
+python sota_run.py --synthetic --save post.npz
+python sota_run.py --synthetic --load post.npz
+
+# 5) Run the fast unit tests
+pytest -q
 ```
 
 Outputs (suffixed `_synthetic` or `_<country>`):
