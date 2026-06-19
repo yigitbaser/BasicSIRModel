@@ -131,6 +131,7 @@ class EpiConfig:
     forecast_damping: float = 0.85  # AR(1) damping of R_t over the forecast horizon
     dow_prior_sd: float = 0.15      # prior sd of the day-of-week (log) effect
     infer_generation_interval: bool = True  # propagate generation-interval uncertainty
+    ascertainment_drift: float = 0.05  # FIXED weekly logit-rho drift (kept small on purpose)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +228,7 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     log_Rt = jnp.interp(jnp.arange(n_steps).astype(jnp.float32), week_nodes, log_Rt_weekly)
     # Bound R_t to a plausible epidemic range so the renewal recursion can never
     # overflow to infinity (which would produce NaN gradients / divergences).
-    log_Rt = jnp.clip(log_Rt, jnp.log(0.1), jnp.log(8.0))
+    log_Rt = jnp.clip(log_Rt, jnp.log(0.1), jnp.log(6.0))
     Rt = numpyro.deterministic("Rt", jnp.exp(log_Rt))
 
     # Time-varying ascertainment: the fraction of infections that become reported
@@ -235,16 +236,25 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     # a slow weekly random walk on the logit scale (interpolated to daily). When
     # deaths are *also* fit, the death/IFR stream pins the infection scale, so
     # rho_t becomes properly identified instead of confounded.
-    logit_rho0 = numpyro.sample("logit_rho0", dist.Normal(_logit(0.3), 0.8))
-    sigma_rho = numpyro.sample("sigma_rho", dist.HalfNormal(0.15))
+    # Only the ratio (cases/deaths ~ rho/IFR) is identified by the data, so the
+    # separation of rho_t and IFR relies on their priors being tight. Crucially
+    # the ascertainment *drift* is a small FIXED constant, not a free parameter:
+    # if sigma_rho were inferred it blows up and rho_t absorbs all cases/deaths
+    # misfit, decoupling cases from the infection curve and letting R_t run away.
+    # Fixing slow drift forces both streams to share one infection trajectory,
+    # which is what makes rho and IFR jointly identifiable.
+    logit_rho0 = numpyro.sample("logit_rho0", dist.Normal(_logit(0.3), 0.5))
+    sigma_rho = cfg.ascertainment_drift
     rho_eps = numpyro.sample("rho_rw", dist.Normal(jnp.zeros(n_weeks), 1.0))
     logit_rho_weekly = logit_rho0 + sigma_rho * jnp.cumsum(rho_eps)
     logit_rho = jnp.interp(jnp.arange(n_steps).astype(jnp.float32), week_nodes, logit_rho_weekly)
     rho_t = numpyro.deterministic("rho_t", jax.nn.sigmoid(logit_rho))
 
     # Infection fatality ratio (anchors the absolute infection scale via deaths).
-    # Informative LogNormal prior centred on the configured IFR (pre-vaccine ~0.68%).
-    ifr = numpyro.sample("ifr", dist.LogNormal(jnp.log(cfg.ifr), 0.4))
+    # Informative LogNormal prior centred on the configured IFR (pre-vaccine
+    # ~0.68%); sd 0.25 in log-space keeps it within a credible ~0.4–1.1% range
+    # (literature, see PARAMETERS.md) rather than letting it absorb model misfit.
+    ifr = numpyro.sample("ifr", dist.LogNormal(jnp.log(cfg.ifr), 0.25))
 
     # Day-of-week reporting multiplier (sum-to-zero on the log scale).
     dow_raw = numpyro.sample("dow", dist.Normal(jnp.zeros(7), cfg.dow_prior_sd))

@@ -234,14 +234,24 @@ def main():
     ap.add_argument("--samples", type=int, default=600)
     ap.add_argument("--save", default=None, help="save posterior samples to this .npz path")
     ap.add_argument("--load", default=None, help="skip MCMC and load posterior samples from .npz")
+    ap.add_argument("--with-deaths", action="store_true",
+                    help="jointly fit the deaths stream on REAL data too (off by default: "
+                         "joint real-data fitting is sensitive to delay misspecification; "
+                         "the deaths machinery is validated on synthetic data instead)")
     args = ap.parse_args()
 
     cfg = EpiConfig()
     true_Rt = true_inf = deaths = None
+    # Deaths used in the likelihood. Synthetic always fits deaths (it validates
+    # the joint machinery against a known truth). Real data fits cases-only by
+    # default — joint real-data fitting is sensitive to delay misspecification —
+    # unless the user opts in with --with-deaths.
+    fit_deaths = None
 
     if args.synthetic:
         print("Generating synthetic epidemic with a known R_t (lockdown scenario)...")
         cases, true_Rt, true_inf, _, deaths = make_synthetic(cfg, T=args.days)
+        fit_deaths = deaths
         title = "SYNTHETIC self-test"
     else:
         print(f"Downloading JHU data for {args.country} from {args.start} ({args.days} days)...")
@@ -249,19 +259,22 @@ def main():
             c, d = load_country(args.country, args.start, args.days)
             cases = c.to_numpy(dtype=float)
             deaths = d.to_numpy(dtype=float)
+            fit_deaths = deaths if args.with_deaths else None
             title = f"{args.country} (from {args.start})"
         except Exception as e:  # noqa: BLE001 - fall back to synthetic if offline
             print(f"  Data download failed ({e!r}); falling back to synthetic mode.")
             cases, true_Rt, true_inf, _, deaths = make_synthetic(cfg, T=args.days)
+            fit_deaths = deaths
             title = "SYNTHETIC (network fallback)"
 
     if args.load:
         print(f"Loading posterior samples from {args.load} (skipping MCMC)...")
         samples = load_samples(args.load)
     else:
-        print(f"Fitting renewal model (cases + deaths) on {len(cases)} days with NUTS "
+        streams = "cases + deaths" if fit_deaths is not None else "cases only"
+        print(f"Fitting renewal model ({streams}) on {len(cases)} days with NUTS "
               f"({args.warmup} warmup + {args.samples} samples x2 chains)...")
-        mcmc, _, _ = fit(cases, cfg, horizon=args.horizon, deaths=deaths,
+        mcmc, _, _ = fit(cases, cfg, horizon=args.horizon, deaths=fit_deaths,
                          num_warmup=args.warmup, num_samples=args.samples)
         mcmc.print_summary(exclude_deterministic=True)
         samples = mcmc.get_samples()
@@ -271,7 +284,9 @@ def main():
 
     summarise_samples(samples)
     tag = "_synthetic" if args.synthetic else f"_{args.country.lower()}"
-    plot_results(samples, cases, args.horizon, title, true_Rt, true_inf, tag=tag, deaths=deaths)
+    # Only draw the deaths panel when deaths were actually in the likelihood.
+    plot_results(samples, cases, args.horizon, title, true_Rt, true_inf, tag=tag,
+                 deaths=fit_deaths)
 
 
 if __name__ == "__main__":

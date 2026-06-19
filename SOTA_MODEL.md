@@ -89,7 +89,11 @@ deaths_t  ~ NegativeBinomial( mean = E[deaths_t], dispersion = φ_D )
   **infection-to-death** (log-normal, mean 19 d) delay distributions;
 - **Joint deaths stream** — deaths are far less sensitive to testing capacity, so
   with an informative **IFR** prior the death stream **pins the absolute
-  infection scale** and removes the case-only ascertainment confounding;
+  infection scale** and removes the case-only ascertainment confounding. This is
+  **validated on synthetic data** (it recovers the true IFR, ascertainment and
+  R_t). On *real* data joint fitting is sensitive to delay/IFR misspecification
+  and can be unstable, so real-data runs fit **cases-only by default** and joint
+  fitting is opt-in (`--with-deaths`); see the limitations section;
 - `ρ_t` — **time-varying ascertainment**, a weekly logit random walk (not a
   constant), because the reported fraction of infections rose sharply as testing
   scaled up through 2020;
@@ -250,9 +254,15 @@ Several earlier limitations have since been **addressed** (joint deaths fitting,
 time-varying ascertainment, right-truncation, and generation-interval
 uncertainty — see §2.3). What remains:
 
-- **Scale confounding (mitigated).** From cases *alone* ascertainment and
-  infection scale are confounded; fitting deaths with an IFR prior now pins the
-  scale. Residual dependence on the IFR prior remains.
+- **Scale confounding (mitigated, with caveats).** From cases *alone*
+  ascertainment and infection scale are confounded; fitting deaths with an IFR
+  prior resolves this **on synthetic data**. On **real** data the joint fit is
+  fragile: the fixed infection→case and infection→death delay distributions are
+  rarely both correct, and the resulting inconsistency can push the sampler into
+  degenerate modes (IFR pinned high, R_t at its bound, many divergences). The
+  honest fix would be to *also* infer the delay distributions and/or use
+  region-specific calibrated delays; until then real-data runs default to
+  **cases-only** and joint fitting is an opt-in experiment (`--with-deaths`).
 - **Delay distributions partly fixed.** The generation-interval mean is inferred,
   but the report/death delay distributions are still held at literature values.
 - **Short-horizon only.** Like all such models, it is a 1–3 week forecaster, not
