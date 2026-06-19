@@ -67,6 +67,8 @@ time-varying reproduction number, fit to real data by gradient-based MCMC
 pip install numpyro jax arviz numpy scipy pandas matplotlib
 python sota_run.py --synthetic                 # self-test: recover a known R_t
 python sota_run.py --country Italy --days 120   # fit real JHU data + forecast
+python evaluate.py                              # backtest: WIS / coverage / PIT calibration
+pytest -q                                       # fast unit tests
 ```
 
 It infers the time-varying R&#x209C;, nowcasts true infections behind reporting

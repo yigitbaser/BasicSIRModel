@@ -27,9 +27,11 @@ from sota_model import (
     discretise_gamma,
     discretise_lognormal,
     fit,
-    summarise,
+    summarise_samples,
     credible_band,
     posterior_predictive_cases,
+    save_samples,
+    load_samples,
 )
 
 
@@ -177,6 +179,8 @@ def main():
     ap.add_argument("--horizon", type=int, default=14)
     ap.add_argument("--warmup", type=int, default=600)
     ap.add_argument("--samples", type=int, default=600)
+    ap.add_argument("--save", default=None, help="save posterior samples to this .npz path")
+    ap.add_argument("--load", default=None, help="skip MCMC and load posterior samples from .npz")
     args = ap.parse_args()
 
     cfg = EpiConfig()
@@ -198,12 +202,21 @@ def main():
             cases, true_Rt, true_inf, _ = make_synthetic(cfg, T=args.days)
             title = "SYNTHETIC (network fallback)"
 
-    print(f"Fitting renewal model on {len(cases)} days with NUTS "
-          f"({args.warmup} warmup + {args.samples} samples x2 chains)...")
-    mcmc, _, _ = fit(cases, cfg, horizon=args.horizon,
-                     num_warmup=args.warmup, num_samples=args.samples)
-    mcmc.print_summary(exclude_deterministic=True)
-    samples = summarise(mcmc)
+    if args.load:
+        print(f"Loading posterior samples from {args.load} (skipping MCMC)...")
+        samples = load_samples(args.load)
+    else:
+        print(f"Fitting renewal model on {len(cases)} days with NUTS "
+              f"({args.warmup} warmup + {args.samples} samples x2 chains)...")
+        mcmc, _, _ = fit(cases, cfg, horizon=args.horizon,
+                         num_warmup=args.warmup, num_samples=args.samples)
+        mcmc.print_summary(exclude_deterministic=True)
+        samples = mcmc.get_samples()
+        if args.save:
+            save_samples(samples, args.save)
+            print(f"Saved posterior samples to {args.save}")
+
+    summarise_samples(samples)
     tag = "_synthetic" if args.synthetic else f"_{args.country.lower()}"
     plot_results(samples, cases, args.horizon, title, true_Rt, true_inf, tag=tag)
 

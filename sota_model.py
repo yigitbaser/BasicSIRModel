@@ -104,6 +104,8 @@ class EpiConfig:
     rep_sd: float = 4.5       # infection -> case-report delay sd
     rep_max: int = 30         # truncation length for the reporting delay
     seed_days: int = 7        # number of days of seeded initial infections
+    forecast_damping: float = 0.85  # AR(1) damping of R_t over the forecast horizon
+    dow_prior_sd: float = 0.15      # prior sd of the day-of-week (log) effect
 
 
 # ---------------------------------------------------------------------------
@@ -133,26 +135,58 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     rep = jnp.asarray(rep_pmf)
 
     # --- Priors ---------------------------------------------------------------
-    # Initial daily infections (seed), on a log scale. Centre the prior on the
-    # mean of the first week of observed cases (a rough lower bound on early
-    # infections) so the sampler starts at the right order of magnitude.
+    # Exponential-growth seeding. Instead of a flat seed (which leaves a visible
+    # burn-in artefact while the renewal window "forgets" it), we seed the whole
+    # initial window of length L with infections growing/declining geometrically:
+    #     I_seed[j] = exp(log_I0 + g * (j - (L-1))),  j = 0..L-1
+    # so the most recent seeded day equals exp(log_I0) and the growth rate g is
+    # itself inferred. This is consistent with an epidemic that was already
+    # growing before the observation window opened.
     if cases is not None:
         early = float(np.maximum(np.mean(np.asarray(cases)[:7]), 1.0))
     else:
         early = 100.0
     log_I0 = numpyro.sample("log_I0", dist.Normal(jnp.log(early), 1.5))
-    I_seed = jnp.exp(log_I0) * jnp.ones(seed_days)
+    seed_growth = numpyro.sample("seed_growth", dist.Normal(0.0, 0.1))
+    j = jnp.arange(L)
+    init_window = jnp.exp(log_I0 + seed_growth * (j - (L - 1)).astype(jnp.float32))
+    init_window = jnp.clip(init_window, 1e-6, 1e12)
 
-    # Time-varying reproduction number as a log Gaussian random walk on a WEEKLY
-    # grid, then smoothly interpolated to daily values. The weekly grid (rather
-    # than a daily walk over ~120 parameters) avoids the funnel geometry that
-    # makes daily random walks diverge under NUTS, and matches the smoothing used
-    # by operational tools such as EpiNow2.
+    # Time-varying reproduction number on a WEEKLY grid (smoothly interpolated to
+    # daily). The weekly grid avoids the funnel geometry that makes daily random
+    # walks diverge under NUTS, matching the smoothing used by EpiNow2.
+    #
+    # In-sample weeks follow a log Gaussian random walk. Forecast weeks instead
+    # follow a *dampened* AR(1) process that reverts toward the last in-sample
+    # R_t level: log R_w = anchor + d * (log R_{w-1} - anchor) + sigma * eps.
+    # With damping d < 1 the innovation variance saturates instead of growing
+    # without bound, so forecast credible intervals stay realistic rather than
+    # fanning out to absurd values (the main weakness of a pure random walk).
     n_weeks = n_steps // 7 + 2
+    n_weeks_obs = T // 7 + 1                       # weeks covering the observed window
     log_R0 = numpyro.sample("log_R0", dist.Normal(jnp.log(1.0), 0.5))
     sigma_rw = numpyro.sample("sigma_rw", dist.HalfNormal(0.2))   # week-to-week R_t volatility
-    rw = numpyro.sample("rw", dist.GaussianRandomWalk(scale=1.0, num_steps=n_weeks))
-    log_Rt_weekly = log_R0 + sigma_rw * rw
+    eps = numpyro.sample("rw", dist.Normal(jnp.zeros(n_weeks), 1.0))
+    d = cfg.forecast_damping
+
+    def week_step(carry, inputs):
+        prev, w = carry
+        eps_w, anchor = inputs
+        in_sample = w < n_weeks_obs
+        rw_val = prev + sigma_rw * eps_w                       # random walk (in-sample)
+        ar_val = anchor + d * (prev - anchor) + sigma_rw * eps_w  # dampened (forecast)
+        val = jnp.where(in_sample, rw_val, ar_val)
+        return (val, w + 1), val
+
+    # The AR(1) anchor is the last in-sample weekly level; compute the in-sample
+    # path first (cumulative sum), then run the scan for all weeks.
+    insample_cumsum = log_R0 + sigma_rw * jnp.cumsum(eps[:n_weeks_obs])
+    anchor = insample_cumsum[-1]
+    (_, _), log_Rt_weekly = jax.lax.scan(
+        week_step,
+        (log_R0, jnp.array(0)),
+        (eps, jnp.broadcast_to(anchor, (n_weeks,))),
+    )
     week_nodes = jnp.arange(n_weeks) * 7.0
     log_Rt = jnp.interp(jnp.arange(n_steps).astype(jnp.float32), week_nodes, log_Rt_weekly)
     # Bound R_t to a plausible epidemic range so the renewal recursion can never
@@ -168,7 +202,7 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     rho = numpyro.sample("rho", dist.Beta(6.0, 14.0))
 
     # Day-of-week reporting multiplier (sum-to-zero on the log scale).
-    dow_raw = numpyro.sample("dow", dist.Normal(jnp.zeros(7), 0.3))
+    dow_raw = numpyro.sample("dow", dist.Normal(jnp.zeros(7), cfg.dow_prior_sd))
     dow = dow_raw - jnp.mean(dow_raw)
 
     # Negative-Binomial over-dispersion.
@@ -183,12 +217,7 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
         new_window = jnp.concatenate([window[1:], I_t[None]])
         return new_window, I_t
 
-    # Build the initial window of length L from the seed (pad older days with the
-    # seed level so the convolution is well defined from day 0).
-    init_window = jnp.concatenate(
-        [I_seed[0] * jnp.ones(L - seed_days), I_seed]
-    ) if L > seed_days else I_seed[-L:]
-
+    # `init_window` (the length-L exponential seed) was built with the priors above.
     _, I_scanned = jax.lax.scan(step, init_window, Rt)
     infections = numpyro.deterministic("infections", I_scanned)  # length n_steps
 
@@ -241,8 +270,12 @@ def fit(cases, cfg: EpiConfig, horizon: int = 14, num_warmup=600, num_samples=60
 
 
 def summarise(mcmc):
-    """Print convergence diagnostics and the latest reproduction number."""
-    samples = mcmc.get_samples(group_by_chain=False)
+    """Print the latest reproduction number from a fitted MCMC object."""
+    return summarise_samples(mcmc.get_samples(group_by_chain=False))
+
+
+def summarise_samples(samples):
+    """Print the latest reproduction number from a posterior-samples dict."""
     Rt = np.asarray(samples["Rt"])  # (draws, n_steps)
     rho = np.asarray(samples["rho"])
     Rt_now = Rt[:, -1]  # last modelled day (end of forecast horizon)
@@ -259,6 +292,18 @@ def summarise(mcmc):
 
 def credible_band(arr, lo=0.05, hi=0.95):
     return np.quantile(arr, lo, axis=0), np.median(arr, axis=0), np.quantile(arr, hi, axis=0)
+
+
+def save_samples(samples, path):
+    """Persist a posterior-samples dict to a compressed .npz so you can re-plot
+    or re-score without re-running the (minutes-long) MCMC."""
+    np.savez_compressed(path, **{k: np.asarray(v) for k, v in samples.items()})
+
+
+def load_samples(path):
+    """Load a posterior-samples dict previously written by `save_samples`."""
+    with np.load(path) as data:
+        return {k: data[k] for k in data.files}
 
 
 def posterior_predictive_cases(samples, seed=0):
