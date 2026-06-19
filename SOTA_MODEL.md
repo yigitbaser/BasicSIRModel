@@ -121,11 +121,14 @@ horizon. This matches the dampened-RW projection used by EpiNow2.
 ### 2.6 Seeding
 
 The first weeks of any renewal model are sensitive to how the epidemic is
-*seeded* before the data window opens. Rather than a flat seed (which leaves a
-visible burn-in artefact), the model seeds the whole initial generation-interval
-window with **geometrically growing** infections, with both the level and the
-growth rate inferred. This is consistent with an epidemic already under way when
-observation begins and removes most of the start-up artefact.
+*seeded* before the data window opens. The model seeds the initial
+generation-interval window at a single inferred level. (A more flexible
+exponential seed — inferring a per-day growth across the window — was tried and
+**reverted**: it created a degeneracy in which a decaying seed could explain the
+data *instead of* transmission, biasing R_t low and inflating its uncertainty.
+This is a good example of why every change is re-validated against a known
+synthetic truth before being kept.) The short start-up burn-in the single-level
+seed leaves is excluded from plots and interpretation.
 
 ---
 

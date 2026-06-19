@@ -135,22 +135,19 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     rep = jnp.asarray(rep_pmf)
 
     # --- Priors ---------------------------------------------------------------
-    # Exponential-growth seeding. Instead of a flat seed (which leaves a visible
-    # burn-in artefact while the renewal window "forgets" it), we seed the whole
-    # initial window of length L with infections growing/declining geometrically:
-    #     I_seed[j] = exp(log_I0 + g * (j - (L-1))),  j = 0..L-1
-    # so the most recent seeded day equals exp(log_I0) and the growth rate g is
-    # itself inferred. This is consistent with an epidemic that was already
-    # growing before the observation window opened.
+    # Initial daily infections (seed), on a log scale, centred on the first week
+    # of observed cases. The whole length-L generation window is seeded at this
+    # single level. (An earlier attempt to infer a free per-day seed *growth*
+    # over the window was reverted: it created a degeneracy in which a decaying
+    # seed could explain the data instead of transmission, biasing R_t and
+    # inflating its uncertainty. The single-level seed keeps R_t identified; the
+    # short start-up burn-in it leaves is excluded from plots, see sota_run.py.)
     if cases is not None:
         early = float(np.maximum(np.mean(np.asarray(cases)[:7]), 1.0))
     else:
         early = 100.0
     log_I0 = numpyro.sample("log_I0", dist.Normal(jnp.log(early), 1.5))
-    seed_growth = numpyro.sample("seed_growth", dist.Normal(0.0, 0.1))
-    j = jnp.arange(L)
-    init_window = jnp.exp(log_I0 + seed_growth * (j - (L - 1)).astype(jnp.float32))
-    init_window = jnp.clip(init_window, 1e-6, 1e12)
+    init_window = jnp.exp(log_I0) * jnp.ones(L)
 
     # Time-varying reproduction number on a WEEKLY grid (smoothly interpolated to
     # daily). The weekly grid avoids the funnel geometry that makes daily random
