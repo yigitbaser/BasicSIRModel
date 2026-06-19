@@ -128,5 +128,31 @@ def test_synthetic_truncation_lowers_recent_counts():
     assert abs(trunc[:50].sum() - full[:50].sum()) / full[:50].sum() < 0.05
 
 
+def test_multiregion_generator_shapes_and_distinctness():
+    """make_regions must produce R distinct regions with sensible shapes."""
+    from sota_model import EpiConfig
+    from hierarchical import make_regions
+
+    cfg = EpiConfig()
+    cases, true_Rt = make_regions(cfg, T=80)
+    assert cases.shape == (3, 80)
+    assert true_Rt.shape == (3, 80)
+    assert (cases >= 0).all()
+    # The three regions must have genuinely different R_t trajectories.
+    assert not np.allclose(true_Rt[0], true_Rt[1])
+    assert not np.allclose(true_Rt[1], true_Rt[2])
+
+
+def test_ensemble_pool_combines_samples():
+    import ensemble
+
+    a = np.ones((100, 14))
+    b = 2 * np.ones((100, 14))
+    pooled = ensemble.ensemble_pool(a, b)
+    assert pooled.shape[1] == 14
+    # The pool must contain mass from both components.
+    assert (pooled == 1).any() and (pooled == 2).any()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
