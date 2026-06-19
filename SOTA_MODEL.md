@@ -94,9 +94,11 @@ deaths_t  ~ NegativeBinomial( mean = E[deaths_t], dispersion = φ_D )
   R_t). On *real* data joint fitting is sensitive to delay/IFR misspecification
   and can be unstable, so real-data runs fit **cases-only by default** and joint
   fitting is opt-in (`--with-deaths`); see the limitations section;
-- `ρ_t` — **time-varying ascertainment**, a weekly logit random walk (not a
-  constant), because the reported fraction of infections rose sharply as testing
-  scaled up through 2020;
+- `ρ_t` — **time-varying ascertainment**, a weekly logit random walk, because
+  the reported fraction of infections rose sharply as testing scaled up through
+  2020. This (and the inferred generation interval) is only identifiable with the
+  deaths anchor, so for cases-only fits the model falls back to a **constant**
+  ascertainment and fixed generation interval — the robust, identifiable config;
 - `completeness_t` — **right-truncation correction** for *real-time* data: the
   most recent days are only partially reported, so expected counts are scaled by
   the delay-CDF completeness. **Off by default** (`cfg.apply_truncation`) because
