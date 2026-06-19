@@ -38,7 +38,7 @@ from sota_model import (
 # ---------------------------------------------------------------------------
 # Synthetic ground-truth generator (for validation).
 # ---------------------------------------------------------------------------
-def make_synthetic(cfg: EpiConfig, T=120, seed=1):
+def make_synthetic(cfg: EpiConfig, T=120, seed=1, truncate=False):
     rng = np.random.default_rng(seed)
     gen = discretise_gamma(cfg.gen_mean, cfg.gen_sd, cfg.gen_max)
     rep = discretise_lognormal(cfg.rep_mean, cfg.rep_sd, cfg.rep_max)
@@ -64,15 +64,16 @@ def make_synthetic(cfg: EpiConfig, T=120, seed=1):
         infections[i] = I_t
         window = np.concatenate([window[1:], [I_t]])
 
-    # Right-truncation: emulate incomplete reporting of the most recent days, so
-    # the synthetic data matches what real surveillance looks like (and exercises
-    # the model's reporting-completeness correction). The fraction reported by the
-    # end of the window is the delay CDF at (days remaining).
+    # Optional right-truncation: emulate incomplete reporting of the most recent
+    # days (real-time surveillance). Off by default so the synthetic matches the
+    # default complete-data case; set truncate=True (with cfg.apply_truncation)
+    # to exercise the model's reporting-completeness correction.
     dist_end = (T - 1 - t)
-    rep_cdf = np.cumsum(rep)
-    death_cdf = np.cumsum(death_delay)
-    comp_c = rep_cdf[np.clip(dist_end, 0, len(rep) - 1)]
-    comp_d = death_cdf[np.clip(dist_end, 0, len(death_delay) - 1)]
+    if truncate:
+        comp_c = np.cumsum(rep)[np.clip(dist_end, 0, len(rep) - 1)]
+        comp_d = np.cumsum(death_delay)[np.clip(dist_end, 0, len(death_delay) - 1)]
+    else:
+        comp_c = comp_d = np.ones(T)
 
     # Cases: ascertainment ramps UP over time (testing scaled up), to exercise the
     # time-varying-rho machinery.

@@ -97,10 +97,13 @@ deaths_t  ~ NegativeBinomial( mean = E[deaths_t], dispersion = φ_D )
 - `ρ_t` — **time-varying ascertainment**, a weekly logit random walk (not a
   constant), because the reported fraction of infections rose sharply as testing
   scaled up through 2020;
-- `completeness_t` — **right-truncation correction**: the most recent days are
-  only partially reported (the delay has not fully elapsed), so expected counts
-  are scaled by the delay-CDF completeness. Without this the model misreads
-  incomplete recent data as a real downturn in transmission;
+- `completeness_t` — **right-truncation correction** for *real-time* data: the
+  most recent days are only partially reported, so expected counts are scaled by
+  the delay-CDF completeness. **Off by default** (`cfg.apply_truncation`) because
+  archived/historical series (e.g. the JHU final data) are already complete —
+  applying the correction there would divide the last day's count by a tiny
+  completeness and spuriously inflate recent infections and `R_t`. Enable it only
+  when fitting data pulled in real time;
 - **weekday effect** — a sum-to-zero day-of-week factor for the weekend dip;
 - **Negative-Binomial** likelihoods (separate dispersions for cases and deaths)
   capture over-dispersion so credible intervals stay honest.

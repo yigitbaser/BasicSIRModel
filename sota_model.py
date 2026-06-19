@@ -132,6 +132,7 @@ class EpiConfig:
     dow_prior_sd: float = 0.15      # prior sd of the day-of-week (log) effect
     infer_generation_interval: bool = True  # propagate generation-interval uncertainty
     ascertainment_drift: float = 0.05  # FIXED weekly logit-rho drift (kept small on purpose)
+    apply_truncation: bool = False     # right-truncation correction (ONLY for real-time data)
 
 
 # ---------------------------------------------------------------------------
@@ -289,16 +290,19 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     # --- Observation model ----------------------------------------------------
     days = jnp.arange(n_steps)
 
-    # Right-truncation: the most recent days have only *partially* been reported,
-    # because the infection->report delay has not fully elapsed. The fraction of
-    # eventual reports already observed by the end of the window is the CDF of the
-    # delay distribution evaluated at (days remaining). Multiplying expected
-    # counts by this completeness curve stops the model from reading incomplete
-    # recent data as a genuine downturn in transmission.
-    rep_cdf = jnp.cumsum(rep)
+    # Right-truncation: for REAL-TIME data the most recent days are only partially
+    # reported (the infection->report delay has not fully elapsed), so expected
+    # counts are scaled by the delay-CDF completeness. This is OFF by default
+    # because archived/historical data (e.g. the JHU final series) is already
+    # complete — applying the correction there would divide the last day's count
+    # by a tiny completeness and spuriously inflate recent infections / R_t.
     days_until_end = (T - 1 - days).astype(jnp.int32)
-    completeness_cases = jnp.where(
-        days < T, rep_cdf[jnp.clip(days_until_end, 0, len(rep) - 1)], 1.0)
+    if cfg.apply_truncation:
+        rep_cdf = jnp.cumsum(rep)
+        completeness_cases = jnp.where(
+            days < T, rep_cdf[jnp.clip(days_until_end, 0, len(rep) - 1)], 1.0)
+    else:
+        completeness_cases = jnp.ones(n_steps)
 
     # Expected reported cases = ascertainment(t) * (infections * report delay)
     #                           * day-of-week * reporting-completeness.
@@ -316,9 +320,12 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     # Expected deaths = IFR * (infections convolved with infection->death delay)
     #                   * death-reporting-completeness. Only when deaths are fit.
     if rich_obs:
-        death_cdf = jnp.cumsum(death_pmf)
-        completeness_deaths = jnp.where(
-            days < T, death_cdf[jnp.clip(days_until_end, 0, len(death_pmf) - 1)], 1.0)
+        if cfg.apply_truncation:
+            death_cdf = jnp.cumsum(death_pmf)
+            completeness_deaths = jnp.where(
+                days < T, death_cdf[jnp.clip(days_until_end, 0, len(death_pmf) - 1)], 1.0)
+        else:
+            completeness_deaths = jnp.ones(n_steps)
         conv_d = jnp.convolve(infections, death_pmf)[:n_steps]
         expected_d_complete = jnp.clip(ifr * conv_d, 1e-4, None)
         numpyro.deterministic("expected_deaths_complete", expected_d_complete)
