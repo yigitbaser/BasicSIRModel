@@ -285,8 +285,13 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     #                           * day-of-week * reporting-completeness.
     conv = jnp.convolve(infections, rep)[:n_steps]
     weekday = days % 7
-    expected = rho_t * conv * jnp.exp(dow[weekday]) * completeness_cases
-    expected = jnp.clip(expected, 1e-3, None)
+    # "Complete" expectation = what counts will be once fully reported (the
+    # nowcast/forecast quantity, continuous across the data->forecast boundary).
+    expected_complete = jnp.clip(rho_t * conv * jnp.exp(dow[weekday]), 1e-3, None)
+    numpyro.deterministic("expected_cases_complete", expected_complete)
+    # Truncated expectation = what has been reported so far; used for the
+    # likelihood against the (incomplete) recent observations.
+    expected = jnp.clip(expected_complete * completeness_cases, 1e-3, None)
     numpyro.deterministic("expected_cases", expected)
 
     # Expected deaths = IFR * (infections convolved with infection->death delay)
@@ -295,7 +300,9 @@ def renewal_model(cases, cfg: EpiConfig, horizon: int = 0, gen_pmf=None, rep_pmf
     completeness_deaths = jnp.where(
         days < T, death_cdf[jnp.clip(days_until_end, 0, len(death_pmf) - 1)], 1.0)
     conv_d = jnp.convolve(infections, death_pmf)[:n_steps]
-    expected_d = jnp.clip(ifr * conv_d * completeness_deaths, 1e-4, None)
+    expected_d_complete = jnp.clip(ifr * conv_d, 1e-4, None)
+    numpyro.deterministic("expected_deaths_complete", expected_d_complete)
+    expected_d = jnp.clip(expected_d_complete * completeness_deaths, 1e-4, None)
     numpyro.deterministic("expected_deaths", expected_d)
 
     # Negative-Binomial likelihoods on the observed window only.
@@ -394,21 +401,26 @@ def load_samples(path):
         return {k: data[k] for k in data.files}
 
 
-def posterior_predictive_cases(samples, seed=0):
+def posterior_predictive_cases(samples, seed=0, complete=True):
     """Draw posterior-predictive reported cases (fit + forecast) in numpy.
 
     For each posterior draw we sample Negative-Binomial observation noise around
-    that draw's `expected_cases`, using its over-dispersion `phi`. The spread of
+    that draw's expected cases, using its over-dispersion `phi`. The spread of
     the result is the full predictive uncertainty shown on the forecast plot.
     """
-    return _nb_predictive(samples["expected_cases"], samples["phi"], seed)
+    # `complete=True` gives the nowcast/forecast quantity (eventual fully-reported
+    # counts, continuous across the boundary); the raw observed data are the
+    # truncated counts and are plotted as points.
+    key = "expected_cases_complete" if complete and "expected_cases_complete" in samples else "expected_cases"
+    return _nb_predictive(samples[key], samples["phi"], seed)
 
 
-def posterior_predictive_deaths(samples, seed=1):
+def posterior_predictive_deaths(samples, seed=1, complete=True):
     """Draw posterior-predictive daily deaths (fit + forecast) in numpy."""
     if "expected_deaths" not in samples:
         raise KeyError("This posterior has no deaths stream (model fit without deaths).")
-    return _nb_predictive(samples["expected_deaths"], samples["phi_deaths"], seed)
+    key = "expected_deaths_complete" if complete and "expected_deaths_complete" in samples else "expected_deaths"
+    return _nb_predictive(samples[key], samples["phi_deaths"], seed)
 
 
 def _nb_predictive(expected, phi, seed):
