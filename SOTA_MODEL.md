@@ -73,24 +73,37 @@ The random walk lets `R_t` move smoothly over time, with `σ_rw` (itself
 inferred) controlling how fast. This is what lets the model discover a lockdown
 or a variant takeover **from the data alone**, with no hand-coded `beta(t)`.
 
-### 2.3 Observation model: from infections to reported cases
+### 2.3 Observation model: from infections to reported cases *and deaths*
 
-Latent infections are not observed; reported cases are. The map is:
+Latent infections are not observed; reported cases and deaths are. Both streams
+are fit **jointly**:
 
 ```
-E[cases_t] = ρ · ( Σ_{d≥0} π_d · I_{t−d} ) · weekday_effect_t
-cases_t   ~ NegativeBinomial( mean = E[cases_t], dispersion = φ )
+E[cases_t]  = ρ_t · ( Σ_{d≥0} π_d  · I_{t−d} ) · weekday_t · completeness_t
+E[deaths_t] = IFR · ( Σ_{d≥0} π^D_d · I_{t−d} )            · completeness^D_t
+cases_t   ~ NegativeBinomial( mean = E[cases_t],  dispersion = φ )
+deaths_t  ~ NegativeBinomial( mean = E[deaths_t], dispersion = φ_D )
 ```
 
-- `π_d` — **infection-to-report delay** (discretised log-normal, mean 9 d:
-  incubation + test/report lag);
-- `ρ` — **ascertainment** (fraction of infections ever reported). In case-only
-  data only `ρ·I` is identified, so `ρ` gets an informative prior
-  (Beta(6,14): mean 0.30) reflecting external seroprevalence evidence;
-- **weekday effect** — a multiplicative day-of-week factor (sum-to-zero on the
-  log scale) for the very real weekend reporting dip;
-- **Negative-Binomial** likelihood — captures over-dispersion (variance ≫ mean)
-  that a Poisson would underestimate, so credible intervals are honest.
+- `π_d` / `π^D_d` — **infection-to-report** (log-normal, mean 9 d) and
+  **infection-to-death** (log-normal, mean 19 d) delay distributions;
+- **Joint deaths stream** — deaths are far less sensitive to testing capacity, so
+  with an informative **IFR** prior the death stream **pins the absolute
+  infection scale** and removes the case-only ascertainment confounding;
+- `ρ_t` — **time-varying ascertainment**, a weekly logit random walk (not a
+  constant), because the reported fraction of infections rose sharply as testing
+  scaled up through 2020;
+- `completeness_t` — **right-truncation correction**: the most recent days are
+  only partially reported (the delay has not fully elapsed), so expected counts
+  are scaled by the delay-CDF completeness. Without this the model misreads
+  incomplete recent data as a real downturn in transmission;
+- **weekday effect** — a sum-to-zero day-of-week factor for the weekend dip;
+- **Negative-Binomial** likelihoods (separate dispersions for cases and deaths)
+  capture over-dispersion so credible intervals stay honest.
+
+The **generation interval** mean is itself an inferred parameter (recomputed
+inside the model via a differentiable incomplete-gamma discretisation), so its
+uncertainty propagates into `R_t` rather than being assumed away.
 
 ### 2.4 Inference
 
@@ -205,8 +218,9 @@ Outputs (suffixed `_synthetic` or `_<country>`):
   the R_t = 1 epidemic threshold;
 - **`sota_forecast_*.png`** — the fit and the probabilistic forecast against
   observed cases;
-- a console summary: ascertainment, current R_t with credible interval, and
-  `P(R_t > 1)` (i.e. the posterior probability the epidemic is growing).
+- **`sota_deaths_*.png`** — the jointly-fit deaths stream and its forecast;
+- a console summary: latest ascertainment, inferred IFR, current R_t with
+  credible interval, and `P(R_t > 1)` (posterior probability of growth).
 
 ---
 
@@ -232,20 +246,21 @@ and how sure are we?"*
 
 ## 6. Limitations & honest caveats
 
-- **Scale confounding.** From case data alone, ascertainment `ρ` and the
-  absolute number of infections are confounded; we resolve it with an
-  informative prior. `R_t` and the case forecast are unaffected.
-- **Fixed delay/generation distributions.** These are taken from the literature
-  (`PARAMETERS.md`) and held fixed; a fuller treatment would propagate their
-  uncertainty too.
-- **Right-truncation.** The most recent days are based on incomplete reporting;
-  operational tools add an explicit truncation model. The random walk partially
-  absorbs this but recent `R_t` should be read with care.
+Several earlier limitations have since been **addressed** (joint deaths fitting,
+time-varying ascertainment, right-truncation, and generation-interval
+uncertainty — see §2.3). What remains:
+
+- **Scale confounding (mitigated).** From cases *alone* ascertainment and
+  infection scale are confounded; fitting deaths with an IFR prior now pins the
+  scale. Residual dependence on the IFR prior remains.
+- **Delay distributions partly fixed.** The generation-interval mean is inferred,
+  but the report/death delay distributions are still held at literature values.
 - **Short-horizon only.** Like all such models, it is a 1–3 week forecaster, not
   a long-range predictor — transmission can change for reasons no model sees.
-- **One signal.** It fits a single stream (cases). The strongest operational
-  setups jointly fit cases, hospitalisations and deaths, and combine multiple
-  models into a calibrated **ensemble** — empirically the best performer.
+- **Single region, single model.** It fits one location with one model. The
+  strongest operational setups pool **multiple regions** hierarchically and
+  combine **multiple models** into a calibrated ensemble (the empirical best
+  performer) — addressed in the follow-up extensions PR.
 
 ---
 
