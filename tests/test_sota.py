@@ -100,6 +100,19 @@ def test_pit_values_in_unit_interval():
     assert ((pit >= 0) & (pit <= 1)).all()
 
 
+def test_waning_immunity_produces_endemic_state():
+    """Waning immunity (SEIRS) must avoid burn-out: infections persist at the end
+    of a long run, unlike the lifelong-immunity model which decays to ~0."""
+    import models
+
+    waning = models.SEIRD(population=1_000_000, I0=100, days=730, waning_days=120).run()
+    none = models.SEIRD(population=1_000_000, I0=100, days=730).run()
+    I_wane_end = waning.frame["Infected"].iloc[-1]
+    I_none_end = none.frame["Infected"].iloc[-1]
+    assert I_wane_end > 1000        # endemic plateau, not burned out
+    assert I_none_end < 10          # lifelong immunity -> burns out
+
+
 def test_synthetic_truncation_lowers_recent_counts():
     """make_synthetic(truncate=True) should report fewer of the most-recent-day
     counts than the complete (truncate=False) version, by construction."""
@@ -113,6 +126,32 @@ def test_synthetic_truncation_lowers_recent_counts():
     assert trunc[-5:].sum() < full[-5:].sum()
     # Early days are essentially complete in both.
     assert abs(trunc[:50].sum() - full[:50].sum()) / full[:50].sum() < 0.05
+
+
+def test_multiregion_generator_shapes_and_distinctness():
+    """make_regions must produce R distinct regions with sensible shapes."""
+    from sota_model import EpiConfig
+    from hierarchical import make_regions
+
+    cfg = EpiConfig()
+    cases, true_Rt = make_regions(cfg, T=80)
+    assert cases.shape == (3, 80)
+    assert true_Rt.shape == (3, 80)
+    assert (cases >= 0).all()
+    # The three regions must have genuinely different R_t trajectories.
+    assert not np.allclose(true_Rt[0], true_Rt[1])
+    assert not np.allclose(true_Rt[1], true_Rt[2])
+
+
+def test_ensemble_pool_combines_samples():
+    import ensemble
+
+    a = np.ones((100, 14))
+    b = 2 * np.ones((100, 14))
+    pooled = ensemble.ensemble_pool(a, b)
+    assert pooled.shape[1] == 14
+    # The pool must contain mass from both components.
+    assert (pooled == 1).any() and (pooled == 2).any()
 
 
 if __name__ == "__main__":

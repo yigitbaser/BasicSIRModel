@@ -60,14 +60,19 @@ time-varying reproduction number, fit to real data by gradient-based MCMC
 | File | Purpose |
 |---|---|
 | [`SOTA_MODEL.md`](SOTA_MODEL.md) | Explains the method and why it is state of the art |
-| [`sota_model.py`](sota_model.py) | The renewal model + NUTS inference + forecasting |
+| [`sota_model.py`](sota_model.py) | The renewal model + NUTS inference + forecasting (dampened R_t, joint deaths, time-varying ascertainment, right-truncation, GI uncertainty) |
 | [`sota_run.py`](sota_run.py) | Synthetic self-test, real-data loader, plotting |
+| [`evaluate.py`](evaluate.py) | Backtesting + Weighted Interval Score, coverage and PIT calibration |
+| [`ensemble.py`](ensemble.py) | Multi-model ensemble (baseline + renewal) scored by WIS |
+| [`hierarchical.py`](hierarchical.py) | Partially-pooled multi-region renewal model (shared hyperparameters, per-region R_t) |
 
 ```bash
 pip install numpyro jax arviz numpy scipy pandas matplotlib
 python sota_run.py --synthetic                 # self-test: recover a known R_t
 python sota_run.py --country Italy --days 120   # fit real JHU data + forecast
 python evaluate.py                              # backtest: WIS / coverage / PIT calibration
+python ensemble.py                              # baseline vs renewal vs ensemble (WIS)
+python hierarchical.py                          # joint multi-region fit, per-region R_t
 pytest -q                                       # fast unit tests
 ```
 
