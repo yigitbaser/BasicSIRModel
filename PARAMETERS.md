@@ -23,6 +23,7 @@ transmissibility and severity — see the "Variant note" at the bottom.
 | Serial interval | — | **5.2 days** (pooled) | 95% CI 4.9–5.5 (range 4.2–7.5) | Rai et al. 2021; Nishiura et al. 2020 |
 | Infectious period | 1/γ | **≈ 6–10 days** (modelling: 6.5 d used here) | viral shedding context-dependent | Byrne et al. 2020 (BMJ Open); WHO |
 | Generation time | — | **≈ 5 days** | 95% CI ~4–6 | Ganyani et al. 2020 (Eurosurveillance) |
+| Infection → death delay | — | **≈ 18–21 days** (modelling: 19 d used here) | onset-to-death ~17–18 d + infection-to-onset ~5 d | Verity et al. 2020 (Lancet ID); Wood 2021 |
 
 ## Severity parameters (pre-vaccine era)
 
